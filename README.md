@@ -1166,8 +1166,41 @@ g++ -std=c++20 -Wall -Wextra -pthread -fsanitize=thread -O1 -o test test.cpp
 ---
 
 ## Changelog
+v1.4 (текущая)
++Критические исправления (перенесены из v1.3)
+[FIX-1] wait(), wait_result(), wait_all(), GroupHandle::wait() — обнаруживают вызов из воркер-потока пула и немедленно бросают `std::logic_error` вместо thread-starvation deadlock.
+[FIX-2] Деструктор `~thread_pool` — при отмене задач из `rq_` теперь вызывает `resolve_locked()` и `group_finish_locked()`. До исправления `GroupInfo::pending_ids` не обнулялся → `wait_group_impl` мог зависнуть после начала shutdown.
+[FIX-3] `cancel()` — не отменяет задачу если `consumed=true` (кто-то уже заблокирован в `wait_result()`). Раньше `cancel()` выигрывал гонку и `wait_result` бросал "task cancelled" вместо реального результата.
 
-### v1.2 (текущая)
+Защита от ошибок пользователя
+
+[P1] `create(0)` → `std::invalid_argument` немедленно. Раньше пул без воркеров создавался успешно, а `wait_all()` зависал навсегда.
+[P2] Кольцевые зависимости (A→B→A) — детектируются BFS при добавлении задачи → `std::invalid_argument`. Самозависимость (A depends_on A) — частный случай.
+[P3] `last_id_` стартует с `FIRST_TASK_ID=1`. `task_id=0` зарезервирован как `INVALID_TASK_ID` (аналог `nullptr`). `depends_on={0}` → `invalid_argument`.
+[P4] `wait_result<T>` с неверным типом `T` → `std::runtime_error` с именами запрошенного и хранимого типов вместо загадочного `std::bad_any_cast`.
+[P5] `GroupHandle::add_task()` и `GroupHandle::wait()` на moved-from или уже исчерпанном handle → `std::logic_error` вместо UB / разыменования nullptr.
+[P7] `max_retries > RETRIES_HARD_LIMIT(255)` → `std::invalid_argument`. Предотвращает случайный бесконечный retry из-за опечатки.
+[P8] `TaskOptions::validate()` — явная проверка опций до захвата мьютекса. Ошибка диагностируется раньше и с понятным сообщением.
+
+Исправления, выявленные тестами
+
+[B1] `cancel()` — устранён двойной `infos_.find(id)` (артефакт слияния патчей).
+[B2] `check_cycle_locked` явно перемещён в секцию `private`.
+[B3] `wait_all()` защищён `assert_not_worker_locked` — аналогично `wait()`/`wait_result()`.
+[B4] `wait_all(cleanup=true)` — кумулятивные счётчики `stat_*` не обнуляются; вводится базис (`stat_*_base_`, `last_id_base_`). Следующий `wait_all()` корректно ждёт только задачи, добавленные после `cleanup`.
+[B5] `stats().total_submitted` теперь корректен после `cleanup`: `last_id_ - FIRST_TASK_ID` вместо сырого `last_id_`.
+
+Удалено
+
+[P6] Флаг `cleaned_up_` и блокировка `add_task` после `wait_all(cleanup=true)` — оказались слишком агрессивными и ломали легальные сценарии повторного использования пула. Реальную защиту обеспечивает существующая проверка `infos_.count(dep)` в фазе валидации.
+
+
+v1.3
+
+[FIX-1] Deadlock: `wait*()`/`wait_group_impl()` из воркер-потока → `std::logic_error`. Поле `worker_ids_` хранит id всех воркеров.
+[FIX-2] Деструктор: `resolve_locked()` + `group_finish_locked()` при отмене задач из `rq_`.
+[FIX-3] `cancel()`: не отменяет `consumed`-задачи.
+### v1.2 
 
 **Исправлены баги:**
 
