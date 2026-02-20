@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════
 //  thread_pool  +  smart dispatcher  |  C++20
-//  Version: v1.2
+//  Version: v1.4
 //
 //  Возможности:
 //  [D1] ПРИОРИТЕТЫ      — std::priority_queue; Critical > High > Normal > Low
@@ -25,8 +25,6 @@
 //  Семантика shutdown (~thread_pool):
 //    Все незапущенные задачи (pending_ и rq_) отменяются.
 //    Уже running задачи дожидаются завершения.
-//
-
 // ═══════════════════════════════════════════════════════════════════
 #pragma once
 
@@ -49,12 +47,16 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <algorithm>
 
 
 // ────────────────────────────────────────────────────────────────────
 // Публичные перечисления
 // ────────────────────────────────────────────────────────────────────
 
+inline constexpr uint32_t RETRIES_HARD_LIMIT = 255; ///< лимит retry
+inline constexpr uint64_t INVALID_TASK_ID = 0;      ///< зарезервирован
+inline constexpr uint64_t FIRST_TASK_ID = 1;        ///< первый валидный id
 /// Приоритет задачи. Critical — наивысший, Low — наименьший.
 enum class Priority : int { Low = 0, Normal = 1, High = 2, Critical = 3 };
 
@@ -86,9 +88,24 @@ struct TaskOptions {
     std::string           name        = {};               ///< Человекочитаемое имя (для отладки/stats)
     uint64_t              group_id    = 0;                ///< Группа (0 = нет группы); см. make_group()
 
-    // Примечание: auto_cleanup — внутренняя деталь реализации submit().
-    // Намеренно убрано из публичного API. Используйте submit() для задач
-    // с автоматической очисткой записи.
+    /// Быстрая проверка опций до захвата мьютекса пула.
+    /// Бросает std::invalid_argument при очевидных ошибках.
+    void validate() const {
+        
+        if (max_retries > RETRIES_HARD_LIMIT)
+            throw std::invalid_argument(
+                "TaskOptions: max_retries=" + std::to_string(max_retries)
+                + " превышает RETRIES_HARD_LIMIT=" + std::to_string(RETRIES_HARD_LIMIT)
+                + ". Вероятно, опечатка. Используйте RETRIES_HARD_LIMIT явно, "
+                  "если действительно нужно.");
+
+    
+        for (uint64_t dep : depends_on)
+            if (dep == INVALID_TASK_ID)
+                throw std::invalid_argument(
+                    "TaskOptions: depends_on содержит INVALID_TASK_ID (0). "
+                    "task_id=0 зарезервирован как «нет задачи».");
+    }
 };
 
 
@@ -109,7 +126,7 @@ struct PoolStats {
     uint64_t total_cancelled    = 0; ///< Отменено
 
     void print(std::ostream& os = std::cout) const {
-        os << "─── PoolStats ───────────────────\n"
+        os << "---- PoolStats -----------------\n"
            << "  ready_queue : " << ready_queue_size   << '\n'
            << "  pending_deps: " << pending_deps_count << '\n'
            << "  active      : " << active_workers     << '\n'
@@ -117,7 +134,7 @@ struct PoolStats {
            << "  completed   : " << total_completed    << '\n'
            << "  failed      : " << total_failed       << '\n'
            << "  cancelled   : " << total_cancelled    << '\n'
-           << "─────────────────────────────────\n";
+           << "--------------------------------\n";
     }
 };
 
@@ -176,7 +193,7 @@ struct TaskInfo {
     TaskStatus         status       = TaskStatus::pending;
     bool               consumed     = false; ///< true после первого wait/wait_result; run() не erase consumed
     std::any           result;               ///< Результат (для non-void add_task)
-    std::exception_ptr error;               ///< Сохранённое исключение (status==failed)
+    std::exception_ptr error;                ///< Сохранённое исключение (status==failed)
     std::string        name;
     uint32_t           attempts     = 0;
     uint64_t           group_id     = 0;
@@ -212,7 +229,7 @@ struct PendingEntry {
 /// Состояние группы задач [D5].
 struct GroupInfo {
     std::unordered_set<uint64_t> pending_ids; ///< Id задач группы ещё не в terminal-статусе
-    bool sealed = false; ///< true после вызова GroupHandle::wait()
+    bool sealed = false;                      ///< true после вызова GroupHandle::wait()
 };
 
 
@@ -246,7 +263,7 @@ public:
     GroupHandle(GroupHandle&& o) noexcept
         : pool_(std::move(o.pool_)), gid_(o.gid_), done_(o.done_)
     {
-        o.done_ = true; // moved-from больше не владеет группой
+        o.done_ = true; 
     }
 
     GroupHandle(const GroupHandle&)            = delete;
@@ -292,6 +309,11 @@ class thread_pool : public std::enable_shared_from_this<thread_pool> {
 public:
     /// Единственный способ создания пула. Запускает n воркеров.
     static std::shared_ptr<thread_pool> create(uint32_t n) {
+    if (n == 0)
+        throw std::invalid_argument(
+            "thread_pool::create: n=0 — пул без воркеров бесполезен. "
+            "Все задачи будут висеть в очереди вечно. "
+            "Используйте хотя бы n=1 или std::thread::hardware_concurrency().");
         return std::make_shared<thread_pool>(ctor_token{}, n);
     }
 
@@ -299,7 +321,10 @@ public:
     thread_pool(ctor_token, uint32_t n) {
         threads_.reserve(n);
         for (uint32_t i = 0; i < n; ++i)
+        {
             threads_.emplace_back(&thread_pool::run, this);
+            worker_ids_.insert(threads_.back().get_id());
+        }
     }
 
     thread_pool(const thread_pool&)            = delete;
@@ -309,15 +334,6 @@ public:
 
 
     // ── add_task ────────────────────────────────────────────────────
-    //
-    // Добавляет задачу в пул и возвращает task_id (uint64_t).
-    // Результат доступен через wait_result(id).
-    // Зависит от opts.depends_on — задача будет pending пока они не завершены.
-    //
-    // Исключения:
-    //   std::runtime_error  — пул завершается (draining/stopped)
-    //   std::invalid_argument — неизвестный group_id или dep id
-    //   std::runtime_error  — группа уже запечатана
 
     /// Добавляет задачу с параметрами по умолчанию.
     template <typename F, typename... Args>
@@ -328,12 +344,8 @@ public:
     /// Добавляет задачу с явными опциями.
     template <typename F, typename... Args>
     uint64_t add_task(TaskOptions opts, F&& f, Args&&... a) {
-        // Построение Task допустимо под мьютексом: конструктор только копирует
-        // аргументы, не вызывает пользовательский код.
         auto task_ptr = std::make_shared<Task>(std::forward<F>(f), std::forward<Args>(a)...);
-
         std::unique_lock<std::mutex> lk(mtx_);
-
         if (state_.load() != PoolState::running)
             throw std::runtime_error("thread_pool: пул завершается");
 
@@ -342,13 +354,6 @@ public:
 
 
     // ── submit ──────────────────────────────────────────────────────
-    //
-    // Типобезопасный API: возвращает std::future<T>.
-    // task_id не возвращается — записи infos_ удаляются автоматически.
-    // Исключения задачи попадают в future (fut.get() ре-бросит их).
-    //
-    // [[nodiscard]]: игнорирование future приведёт к потере исключений задачи.
-
     /// Добавляет задачу без опций. Возвращает std::future<T>.
     template <typename F, typename... Args>
     [[nodiscard]]
@@ -368,7 +373,6 @@ public:
         using Fn = std::decay_t<F>;
         using R  = std::invoke_result_t<Fn, std::decay_t<Args>...>;
 
-        // Связываем функцию и аргументы в bound-вызов.
         auto bound = [func = Fn(std::forward<F>(f)),
                       tup  = std::make_tuple(std::forward<Args>(args)...)]() mutable -> R {
             if constexpr (std::is_void_v<R>)
@@ -377,13 +381,8 @@ public:
                 return std::apply(func, tup);
         };
 
-        // packaged_task транспортирует результат/исключение в future.
-        // Хранится через shared_ptr — lifetime гарантирован до вызова.
         auto packaged = std::make_shared<std::packaged_task<R()>>(std::move(bound));
         std::future<R> fut = packaged->get_future();
-
-        // Task-обёртка вызывает packaged_task; исключения уйдут в future,
-        // а не в воркер — run() не увидит failed-состояния.
         auto wrapper = [packaged]() { (*packaged)(); };
         auto task_ptr = std::make_shared<Task>(std::move(wrapper));
 
@@ -393,8 +392,6 @@ public:
             if (state_.load() != PoolState::running)
                 throw std::runtime_error("thread_pool: пул завершается");
 
-            // auto_cleanup=true: infos_ запись будет удалена после выполнения,
-            // т.к. task_id не возвращается и wait_result никогда не вызовется.
             enqueue_locked(std::move(opts), /*auto_cleanup=*/true, std::move(task_ptr));
         }
 
@@ -403,24 +400,15 @@ public:
 
 
     // ── cancel [D4] ─────────────────────────────────────────────────
-    //
-    // Отменяет задачу до её запуска.
-    // Возвращает true  — задача отменена успешно.
-    // Возвращает false — задача уже running или в terminal-статусе.
-    //
-    // Каскадной отмены зависимых задач НЕТ: зависимые задачи будут
-    // выполнены после того, как отменённая "разрешится" через resolve_locked.
-    //
-    // Исключения:
-    //   std::invalid_argument — неизвестный task_id
 
     bool cancel(uint64_t id) {
         std::unique_lock<std::mutex> lk(mtx_);
-
         auto it = infos_.find(id);
         if (it == infos_.end())
             throw std::invalid_argument(
                 "cancel: неизвестный task_id=" + std::to_string(id));
+        if (it->second.consumed)             // [FIX-3 из v1.3] гонка с wait_result
+            return false;
 
         if (it->second.status == TaskStatus::running || terminal(it->second.status))
             return false; // уже поздно или уже terminal
@@ -429,19 +417,19 @@ public:
         it->second.status  = TaskStatus::cancelled;
         ++stat_cancelled_;
 
-        // Если задача была pending — почистить dep_waiters_ от её ссылок.
-        // Это предотвращает разрастание dep_waiters_ при массовых отменах.
         if (auto pit = pending_.find(id); pit != pending_.end()) {
             for (uint64_t dep : pit->second.remaining_deps) {
-                auto& vec = dep_waiters_[dep];
-                vec.erase(std::remove(vec.begin(), vec.end(), id), vec.end());
-                if (vec.empty())
-                    dep_waiters_.erase(dep);
+
+                if (auto dit = dep_waiters_.find(dep); dit != dep_waiters_.end()) {
+                    auto &vec = dit->second;
+                    vec.erase(std::remove(vec.begin(), vec.end(), id), vec.end());
+                    if (vec.empty())
+                        dep_waiters_.erase(dit);
+                }
             }
             pending_.erase(pit);
         }
 
-        // Разблокировать зависимые задачи (они не отменяются каскадно).
         resolve_locked(id);
         group_finish_locked(gid, id);
         cv_.notify_all();
@@ -450,16 +438,10 @@ public:
 
 
     // ── wait ────────────────────────────────────────────────────────
-    //
-    // Блокирует поток до завершения задачи (любой terminal-статус).
-    // После возврата запись в infos_ удалена; повторный вызов бросает исключение.
-    //
-    // Исключения:
-    //   std::invalid_argument — неизвестный id (или уже consumed)
-    //   std::runtime_error    — double-wait (consumed=true)
 
     void wait(uint64_t id) {
         std::unique_lock<std::mutex> lk(mtx_);
+		assert_not_worker_locked("wait");
         check_id_locked(id);
 
         auto& info = infos_.at(id);
@@ -468,9 +450,6 @@ public:
                 "thread_pool: task id=" + std::to_string(id) + " already consumed");
         info.consumed = true;
 
-        // Используем find вместо at: запись может исчезнуть только если
-        // auto_cleanup=true И !consumed — но мы только что поставили consumed=true,
-        // поэтому run() не сотрёт запись. Предикат через find — defensive check.
         cv_.wait(lk, [&] {
             auto it = infos_.find(id);
             return it == infos_.end() || terminal(it->second.status);
@@ -481,18 +460,10 @@ public:
 
 
     // ── wait_result → std::any ───────────────────────────────────────
-    //
-    // Блокирует поток до завершения задачи и возвращает результат.
-    // После возврата запись удалена; повторный вызов бросает исключение.
-    //
-    // Бросает:
-    //   Оригинальное исключение задачи, если status == failed.
-    //   std::runtime_error("task cancelled"), если status == cancelled.
-    //   std::invalid_argument — неизвестный id.
-    //   std::runtime_error    — double-wait (consumed=true).
 
     std::any wait_result(uint64_t id) {
         std::unique_lock<std::mutex> lk(mtx_);
+		assert_not_worker_locked("wait_result");
         check_id_locked(id);
 
         auto& info = infos_.at(id);
@@ -501,8 +472,6 @@ public:
                 "thread_pool: task id=" + std::to_string(id) + " already consumed");
         info.consumed = true;
 
-        // consumed=true → run() не сотрёт запись (do_erase проверяет !consumed).
-        // Используем find для defensive-проверки на случай будущих изменений.
         cv_.wait(lk, [&] {
             auto it = infos_.find(id);
             return it == infos_.end() || terminal(it->second.status);
@@ -510,8 +479,7 @@ public:
 
         auto it = infos_.find(id);
         if (it == infos_.end()) {
-            // Не должно случаться при consumed=true, но defensive throw лучше
-            // чем молчаливый возврат пустого any.
+
             throw std::runtime_error(
                 "thread_pool: task id=" + std::to_string(id)
                 + " record disappeared unexpectedly");
@@ -539,30 +507,45 @@ public:
     /// Типизированная версия wait_result. Удобна как: pool->wait_result(id, value).
     template <class T>
     void wait_result(uint64_t id, T& v) {
-        v = std::any_cast<T>(wait_result(id));
+    std::any result = wait_result(id);
+
+    try {
+        v = std::any_cast<T>(result);
+    } catch (const std::bad_any_cast&) {
+        throw std::runtime_error(
+            "thread_pool::wait_result<T>: несовпадение типа. "
+            "Запрошен: "  + std::string(typeid(T).name())
+            + ", хранится: " + std::string(result.type().name())
+            + ". Проверьте тип возврата задачи id=" + std::to_string(id) + ".");
+    }
     }
 
 
     // ── wait_all ────────────────────────────────────────────────────
-    //
-    // Ждёт, пока суммарное число завершённых (completed+failed+cancelled)
-    // достигнет снапшота last_id_ на момент вызова.
-    //
-    // cleanup=true: очищает infos_ после ожидания.
-    //   ВАЖНО: после cleanup=true все ранее полученные task_id становятся
-    //   невалидными. Повторный wait/wait_result по ним бросит invalid_argument.
+
 
     void wait_all(bool cleanup = false) {
         std::unique_lock<std::mutex> lk(mtx_);
+        assert_not_worker_locked("wait_all");
+    const uint64_t submitted = last_id_.load() - last_id_base_;
 
-        // Снапшот берётся под мьютексом — нет гонки с параллельными add_task.
-        const uint64_t expected = last_id_.load();
+    if (submitted == 0) return; // нет задач — нечего ждать
 
         cv_.wait(lk, [&] {
-            return stat_completed_ + stat_failed_ + stat_cancelled_ >= expected;
+        const uint64_t done = (stat_completed_ - stat_completed_base_)
+                            + (stat_failed_    - stat_failed_base_)
+                            + (stat_cancelled_ - stat_cancelled_base_);
+        return done >= submitted;
         });
 
-        if (cleanup) infos_.clear();
+    if (cleanup) {
+        infos_.clear();
+
+        stat_completed_base_ = stat_completed_;
+        stat_failed_base_    = stat_failed_;
+        stat_cancelled_base_ = stat_cancelled_;
+        last_id_base_        = last_id_.load();
+    }
     }
 
 
@@ -577,15 +560,6 @@ public:
 
 
     // ── make_group [D5] ─────────────────────────────────────────────
-    //
-    // Создаёт новую группу и возвращает RAII-дескриптор.
-    // Деструктор GroupHandle вызывает wait() (seal + ожидание всех задач группы).
-    //
-    // Использование:
-    //   auto g = pool->make_group();
-    //   g.add_task(fn1);
-    //   g.add_task(TaskOptions{.priority=Priority::High}, fn2);
-    //   // при выходе из scope: g.wait() → ждёт fn1 и fn2
 
     GroupHandle make_group() {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -604,7 +578,7 @@ public:
             (uint64_t)rq_.size(),
             (uint64_t)pending_.size(),
             active_.load(),
-            last_id_.load(),
+            last_id_.load() - FIRST_TASK_ID,
             stat_completed_,
             stat_failed_,
             stat_cancelled_
@@ -613,10 +587,6 @@ public:
 
 
     // ── Деструктор ──────────────────────────────────────────────────
-    //
-    // Переводит пул в draining: все незапущенные задачи (pending_ и rq_)
-    // отменяются. Запущенные задачи дожидаются завершения.
-    // Воркеры получают notify_all и завершают работу.
 
     ~thread_pool() {
         {
@@ -629,17 +599,23 @@ public:
                 if (it != infos_.end() && !terminal(it->second.status)) {
                     it->second.status = TaskStatus::cancelled;
                     ++stat_cancelled_;
+
+                    group_finish_locked(it->second.group_id, task_id);					
                 }
             }
             pending_.clear();
 
-            // Отмена задач, уже лежащих в очереди готовых (rq_).
+
             while (!rq_.empty()) {
                 auto e = rq_.top(); rq_.pop();
                 auto it = infos_.find(e.task_id);
                 if (it != infos_.end() && !terminal(it->second.status)) {
                     it->second.status = TaskStatus::cancelled;
                     ++stat_cancelled_;
+
+                    resolve_locked(e.task_id);
+
+                    group_finish_locked(it->second.group_id, e.task_id);					
                 }
             }
         }
@@ -654,6 +630,17 @@ private:
     // ────────────────────────────────────────────────────────────────
     // Вспомогательные методы (REQUIRES: mtx_ held, если не указано иное)
     // ────────────────────────────────────────────────────────────────
+    /// [FIX-1] Бросает std::logic_error если текущий поток — воркер пула.
+    /// REQUIRES: mtx_ held.
+    void assert_not_worker_locked(const char* caller) const {
+        if (worker_ids_.count(std::this_thread::get_id()))
+            throw std::logic_error(
+                std::string("thread_pool::") + caller
+                + "() вызван из воркер-потока пула — "
+                "это приводит к thread-starvation deadlock. "
+                "Используйте submit() + future из самой задачи, "
+                "либо увеличьте число воркеров.");
+    }
 
     /// Возвращает true, если статус является конечным (нет смысла ждать дальше).
     static bool terminal(TaskStatus s) noexcept {
@@ -677,17 +664,12 @@ private:
 
 
     // ── enqueue_locked ───────────────────────────────────────────────
-    //
-    // REQUIRES: mtx_ held, state_ == running.
-    //
-    // Единственная точка регистрации задачи в infos_ и очередях.
-    // Принимает уже построенный task_ptr; auto_cleanup — внутренний флаг
-    // (true для submit, false для add_task).
-    //
-    // Exception safety: валидация выполняется ДО любой мутации state,
-    // поэтому при исключении состояние пула остаётся консистентным.
+
 
     uint64_t enqueue_locked(TaskOptions opts, bool auto_cleanup, std::shared_ptr<Task> task_ptr) {
+
+    opts.validate();
+  
         // ── Фаза валидации (не мутирует state) ───────────────────────
 
         if (opts.group_id != 0) {
@@ -701,16 +683,21 @@ private:
                     + " уже запечатана");
         }
 
+    const uint64_t new_id = last_id_.load(std::memory_order_relaxed); // будущий id
+    check_cycle_locked(new_id, opts.depends_on);
+
+
         for (uint64_t dep : opts.depends_on) {
             if (!infos_.count(dep))
                 throw std::invalid_argument(
                     "add_task: зависимость id=" + std::to_string(dep)
-                    + " неизвестна (или уже consumed)");
+                  + " неизвестна — не существует, уже consumed, "
+                    "или удалена через wait_all(cleanup=true).");
         }
 
         // ── Фаза коммита (исключения маловероятны — только std::bad_alloc) ──
 
-        const uint64_t id = last_id_++;
+        const uint64_t id = last_id_.fetch_add(1, std::memory_order_relaxed);
 
         TaskInfo& info    = infos_[id];
         info.name         = opts.name.empty() ? "#" + std::to_string(id) : std::move(opts.name);
@@ -720,7 +707,6 @@ private:
         if (opts.group_id != 0)
             groups_[opts.group_id].pending_ids.insert(id);
 
-        // Фильтруем зависимости: уже terminal-задачи не блокируют запуск.
         std::unordered_set<uint64_t> live_deps;
         for (uint64_t dep : opts.depends_on) {
             if (!terminal(infos_[dep].status))
@@ -728,11 +714,11 @@ private:
         }
 
         if (live_deps.empty()) {
-            // Все зависимости уже выполнены (или их не было) → сразу в очередь.
+ 
             info.status = TaskStatus::in_queue;
             push_ready_lk({ opts.priority, id, std::move(task_ptr), opts.max_retries });
         } else {
-            // Задача ждёт. Строим обратный индекс dep → [ждущие задачи].
+
             info.status = TaskStatus::pending;
             for (uint64_t dep : live_deps)
                 dep_waiters_[dep].push_back(id);
@@ -742,13 +728,43 @@ private:
         return id;
     }
 
+/// [P2] BFS по графу зависимостей. Бросает invalid_argument при цикле.
+/// REQUIRES: mtx_ held.
+///
+/// Идея: добавляем ребро new_id → deps[]. Цикл возникает тогда и только
+/// тогда, когда new_id достижим из какого-либо dep (т.е. dep транзитивно
+/// зависит от new_id). Поскольку new_id ещё не добавлен, проверяем обратно:
+/// достижим ли new_id из вершин deps через существующий граф.
+///
+/// На практике граф обычно маленький (десятки задач), поэтому BFS дёшев.
+/// Для систем с тысячами взаимосвязанных задач можно добавить кэш.
+    void check_cycle_locked(uint64_t new_id, const std::vector<uint64_t>& deps) const {
+        for (uint64_t dep : deps)
+            if (dep == new_id)
+                throw std::invalid_argument(
+                    "add_task: self-dependency, task_id=" + std::to_string(new_id));
+
+        std::unordered_set<uint64_t> visited;
+        std::queue<uint64_t>         bfs;
+        for (uint64_t dep : deps) bfs.push(dep);
+
+        while (!bfs.empty()) {
+            uint64_t cur = bfs.front(); bfs.pop();
+            if (!visited.insert(cur).second) continue;
+            auto pit = pending_.find(cur);
+            if (pit == pending_.end()) continue;
+            for (uint64_t ancestor : pit->second.remaining_deps) {
+                if (ancestor == new_id)
+                    throw std::invalid_argument(
+                        "add_task: кольцевая зависимость через id="
+                        + std::to_string(cur) + " → new_id="
+                        + std::to_string(new_id));
+                bfs.push(ancestor);
+            }
+        }
+    }
 
     // ── resolve_locked ───────────────────────────────────────────────
-    //
-    // Вызывается после перехода finished_id в terminal-статус (включая cancelled).
-    // Проходит по обратному индексу dep_waiters_[finished_id] и промоутирует
-    // задачи, у которых больше нет незавершённых зависимостей.
-    // Сложность: O(waiters), не O(all pending).
 
     void resolve_locked(uint64_t finished_id) {
         auto wit = dep_waiters_.find(finished_id);
@@ -788,7 +804,7 @@ private:
     /// После возврата запись группы удаляется из groups_.
     void wait_group_impl(uint64_t gid) {
         std::unique_lock<std::mutex> lk(mtx_);
-
+        assert_not_worker_locked("wait_group_impl (GroupHandle::wait)");
         // Если группа уже неизвестна — считаем, что она завершена.
         auto git = groups_.find(gid);
         if (git == groups_.end()) return;
@@ -834,10 +850,14 @@ private:
             rq_.pop();
             const uint64_t tid = e.task_id;
 
-            // Запись могла исчезнуть (например: wait_all(cleanup=true) во время retry)
-            // или задача была отменена после помещения в rq_ (lazy-cancel).
             auto it = infos_.find(tid);
-            if (it == infos_.end() || it->second.status == TaskStatus::cancelled) {
+            if (it == infos_.end()) {
+                cv_.notify_all(); // разбудить ожидающих этой задачи
+                continue;
+            }
+            if (it->second.status == TaskStatus::cancelled) {
+
+                if (it->second.auto_cleanup) infos_.erase(it);
                 cv_.notify_all(); // разбудить ожидающих этой задачи
                 continue;
             }
@@ -862,7 +882,6 @@ private:
             --active_;
             lk.lock();
 
-            // Запись могла исчезнуть пока мы работали (wait_all(cleanup=true)).
             auto it2 = infos_.find(tid);
             if (it2 == infos_.end()) {
                 cv_.notify_all();
@@ -871,13 +890,13 @@ private:
             auto& info = it2->second;
 
             if (failed && e.retries_left > 0) {
-                // Есть попытки — возвращаем задачу в очередь.
+
                 info.status = TaskStatus::in_queue;
                 --e.retries_left;
                 push_ready_lk(std::move(e));
-                // Без notify: push_ready_lk уже уведомит один воркер.
+
             } else {
-                // Итоговое состояние задачи.
+
                 if (failed) {
                     info.status = TaskStatus::failed;
                     info.error  = eptr;
@@ -888,18 +907,15 @@ private:
                     ++stat_completed_;
                 }
 
-                // Разблокировать зависимые задачи.
+
                 resolve_locked(tid);
 
-                // Уведомить группу.
+
                 group_finish_locked(info.group_id, tid);
 
-                // auto_cleanup: удалить запись, если никто её не ждёт.
-                // Проверяем !consumed: если кто-то вызвал wait/wait_result,
-                // они пометили consumed=true — нельзя erase (они ещё читают запись).
+
                 const bool do_erase = info.auto_cleanup && !info.consumed;
                 if (do_erase) infos_.erase(tid);
-                // Не обращаемся к info после erase — dangling reference.
 
                 cv_.notify_all();
             }
@@ -921,15 +937,21 @@ private:
     std::unordered_map<uint64_t, TaskInfo>               infos_;       ///< Метаданные всех живых задач
     std::unordered_map<uint64_t, GroupInfo>              groups_;      ///< [D5] Активные группы
     uint64_t                                             last_gid_ = 1;///< Генератор group_id (0 зарезервирован)
-
+    std::unordered_set<std::thread::id>                  worker_ids_;  ///< id всех воркер-потоков
+ 
     std::atomic<PoolState>  state_  { PoolState::running };
-    std::atomic<uint64_t>   last_id_{ 0 }; ///< Генератор task_id; также = total submitted
+
+    std::atomic<uint64_t>   last_id_{ FIRST_TASK_ID };        // [P3]
+
     std::atomic<uint32_t>   active_ { 0 }; ///< Воркеров, выполняющих задачу прямо сейчас
 
-    // Счётчики статистики (защищены mtx_).
     uint64_t stat_completed_ = 0;
     uint64_t stat_failed_    = 0;
     uint64_t stat_cancelled_ = 0;
+    uint64_t stat_completed_base_ = 0;
+    uint64_t stat_failed_base_    = 0;
+    uint64_t stat_cancelled_base_ = 0;
+    uint64_t last_id_base_        = FIRST_TASK_ID;
 };
 
 
@@ -944,11 +966,21 @@ uint64_t GroupHandle::add_task(Func&& f, Args&&... a) {
 
 template <typename Func, typename... Args>
 uint64_t GroupHandle::add_task(TaskOptions opts, Func&& f, Args&&... a) {
+    if (done_ || !pool_)
+        throw std::logic_error(
+            "GroupHandle::add_task: вызов на moved-from или уже завершённом handle. "
+            "После GroupHandle::wait() или перемещения объект нельзя использовать.");
+
     opts.group_id = gid_; // принудительно привязываем к этой группе
     return pool_->add_task(std::move(opts), std::forward<Func>(f), std::forward<Args>(a)...);
 }
 
 void GroupHandle::wait() {
+    // [P5]
+    if (done_ || !pool_)
+        throw std::logic_error(
+            "GroupHandle::wait: повторный вызов или вызов на moved-from handle.");
+ 
     done_ = true;
     pool_->wait_group_impl(gid_);
 }
