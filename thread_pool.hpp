@@ -630,8 +630,7 @@ private:
     // ────────────────────────────────────────────────────────────────
     // Вспомогательные методы (REQUIRES: mtx_ held, если не указано иное)
     // ────────────────────────────────────────────────────────────────
-    /// [FIX-1] Бросает std::logic_error если текущий поток — воркер пула.
-    /// REQUIRES: mtx_ held.
+
     void assert_not_worker_locked(const char* caller) const {
         if (worker_ids_.count(std::this_thread::get_id()))
             throw std::logic_error(
@@ -941,7 +940,7 @@ private:
  
     std::atomic<PoolState>  state_  { PoolState::running };
 
-    std::atomic<uint64_t>   last_id_{ FIRST_TASK_ID };        // [P3]
+    std::atomic<uint64_t>   last_id_{ FIRST_TASK_ID };        
 
     std::atomic<uint32_t>   active_ { 0 }; ///< Воркеров, выполняющих задачу прямо сейчас
 
@@ -971,12 +970,12 @@ uint64_t GroupHandle::add_task(TaskOptions opts, Func&& f, Args&&... a) {
             "GroupHandle::add_task: вызов на moved-from или уже завершённом handle. "
             "После GroupHandle::wait() или перемещения объект нельзя использовать.");
 
-    opts.group_id = gid_; // принудительно привязываем к этой группе
+    opts.group_id = gid_; 
     return pool_->add_task(std::move(opts), std::forward<Func>(f), std::forward<Args>(a)...);
 }
 
 void GroupHandle::wait() {
-    // [P5]
+    
     if (done_ || !pool_)
         throw std::logic_error(
             "GroupHandle::wait: повторный вызов или вызов на moved-from handle.");
@@ -984,3 +983,4 @@ void GroupHandle::wait() {
     done_ = true;
     pool_->wait_group_impl(gid_);
 }
+
