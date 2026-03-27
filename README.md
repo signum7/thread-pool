@@ -1185,15 +1185,15 @@ g++ -std=c++20 -Wall -Wextra -pthread -fsanitize=thread -O1 -o test test.cpp
 
 Исправления, выявленные тестами
 
-- [B1] `cancel()` — устранён двойной `infos_.find(id)` (артефакт слияния патчей).
-- [B2] `check_cycle_locked` явно перемещён в секцию `private`.
-- [B3] `wait_all()` защищён `assert_not_worker_locked` — аналогично `wait()`/`wait_result()`.
-- [B4] `wait_all(cleanup=true)` — кумулятивные счётчики `stat_*` не обнуляются; вводится базис (`stat_*_base_`, `last_id_base_`). Следующий `wait_all()` корректно ждёт только задачи, добавленные после `cleanup`.
-- [B5] `stats().total_submitted` теперь корректен после `cleanup`: `last_id_ - FIRST_TASK_ID` вместо сырого `last_id_`.
+- [FIX-6] `cancel()` — устранён двойной `infos_.find(id)` (артефакт слияния патчей).
+- [FIX-5] `check_cycle_locked` явно перемещён в секцию `private`.
+- [FIX-4] `wait_all()` защищён `assert_not_worker_locked` — аналогично `wait()`/`wait_result()`.
+- [FIX-3] `wait_all(cleanup=true)` — кумулятивные счётчики `stat_*` не обнуляются; вводится базис (`stat_*_base_`, `last_id_base_`). Следующий `wait_all()` корректно ждёт только задачи, добавленные после `cleanup`.
+- [FIX-2] `stats().total_submitted` теперь корректен после `cleanup`: `last_id_ - FIRST_TASK_ID` вместо сырого `last_id_`.
 
 Удалено
 
-- [P6] Флаг `cleaned_up_` и блокировка `add_task` после `wait_all(cleanup=true)` — оказались слишком агрессивными и ломали легальные сценарии повторного использования пула. Реальную защиту обеспечивает существующая проверка `infos_.count(dep)` в фазе валидации.
+- [FIX-1] ([P5]) Флаг `cleaned_up_` и блокировка `add_task` после `wait_all(cleanup=true)` — оказались слишком агрессивными и ломали легальные сценарии повторного использования пула. Реальную защиту обеспечивает существующая проверка `infos_.count(dep)` в фазе валидации.
 
 
 ### v1.3
