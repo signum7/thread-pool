@@ -1164,8 +1164,8 @@ g++ -std=c++20 -Wall -Wextra -pthread -fsanitize=thread -O1 -o test test.cpp
 - `-fsanitize=address,undefined` — UB и утечки памяти (ASan/UBSan)
 
 ---
-v2.0 - утеряно. 
-v1.5 - утеряно.
+### v2.0 - утеряно! 
+### v1.5 - утеряно!
 ## Изменения
 v1.4 (текущая)
 +Критические исправления (перенесены из v1.3)
