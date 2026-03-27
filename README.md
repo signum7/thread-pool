@@ -50,7 +50,7 @@ pool->wait_result(b, value);
 - [FAQ](#faq)
 - [Внутреннее устройство](#внутреннее-устройство)
 - [Запуск тестов](#запуск-тестов)
-- [Changelog](#changelog)
+- [Изменения](#Изменения)
 - [Лицензия](#лицензия)
 
 ---
@@ -1167,7 +1167,7 @@ g++ -std=c++20 -Wall -Wextra -pthread -fsanitize=thread -O1 -o test test.cpp
 ### v2.0 - утеряно! 
 ### v1.5 - утеряно!
 ## Изменения
-v1.4 (текущая)
+### v1.4 (текущая)
 +Критические исправления (перенесены из v1.3)
 - [FIX-1] wait(), wait_result(), wait_all(), GroupHandle::wait() — обнаруживают вызов из воркер-потока пула и немедленно бросают `std::logic_error` вместо thread-starvation deadlock.
 - [FIX-2] Деструктор `~thread_pool` — при отмене задач из `rq_` теперь вызывает `resolve_locked()` и `group_finish_locked()`. До исправления `GroupInfo::pending_ids` не обнулялся → `wait_group_impl` мог зависнуть после начала shutdown.
@@ -1196,7 +1196,7 @@ v1.4 (текущая)
 - [P6] Флаг `cleaned_up_` и блокировка `add_task` после `wait_all(cleanup=true)` — оказались слишком агрессивными и ломали легальные сценарии повторного использования пула. Реальную защиту обеспечивает существующая проверка `infos_.count(dep)` в фазе валидации.
 
 
-v1.3
+### v1.3
 
 - [FIX-1] Deadlock: `wait*()`/`wait_group_impl()` из воркер-потока → `std::logic_error`. Поле `worker_ids_` хранит id всех воркеров.
 - [FIX-2] Деструктор: `resolve_locked()` + `group_finish_locked()` при отмене задач из `rq_`.
