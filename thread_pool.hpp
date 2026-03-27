@@ -959,12 +959,12 @@ private:
 // ────────────────────────────────────────────────────────────────────
 
 template <typename Func, typename... Args>
-uint64_t GroupHandle::add_task(Func&& f, Args&&... a) {
+inline uint64_t GroupHandle::add_task(Func&& f, Args&&... a) {
     return add_task(TaskOptions{}, std::forward<Func>(f), std::forward<Args>(a)...);
 }
 
 template <typename Func, typename... Args>
-uint64_t GroupHandle::add_task(TaskOptions opts, Func&& f, Args&&... a) {
+inline uint64_t GroupHandle::add_task(TaskOptions opts, Func&& f, Args&&... a) {
     if (done_ || !pool_)
         throw std::logic_error(
             "GroupHandle::add_task: вызов на moved-from или уже завершённом handle. "
@@ -974,7 +974,7 @@ uint64_t GroupHandle::add_task(TaskOptions opts, Func&& f, Args&&... a) {
     return pool_->add_task(std::move(opts), std::forward<Func>(f), std::forward<Args>(a)...);
 }
 
-void GroupHandle::wait() {
+inline void GroupHandle::wait() {
     
     if (done_ || !pool_)
         throw std::logic_error(
